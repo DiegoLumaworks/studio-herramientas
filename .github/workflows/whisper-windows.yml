@@ -1,0 +1,59 @@
+# Compila whisper-cli.exe ESTÁTICO (sin Visual C++ Redistributable ni DLLs) para Windows x64,
+# lo prueba transcribiendo la muestra oficial y lo publica en la release whisper-<versión>.
+name: whisper-windows
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versión de whisper.cpp
+        default: "1.7.6"
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: v${{ inputs.version }}
+          path: whisper.cpp
+      - name: Compilar (CRT estático, sin OpenMP)
+        shell: pwsh
+        run: |
+          cmake -S whisper.cpp -B build -A x64 `
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DGGML_OPENMP=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF
+          cmake --build build --config Release --target whisper-cli -j 4
+          Get-ChildItem -Recurse build -Filter whisper-cli.exe | Select-Object FullName, Length
+      - name: Comprobar que solo usa DLLs de Windows
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem -Recurse build -Filter whisper-cli.exe | Select-Object -First 1).FullName
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem -Recurse "$vs\VC\Tools\MSVC" -Filter dumpbin.exe | Where-Object FullName -match 'Hostx64\\x64' | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents $exe | Select-String '\.dll' | ForEach-Object { $_.ToString().Trim() }
+          $deps
+          $malas = $deps | Where-Object { $_ -match '(?i)msvcp|vcruntime|vcomp|ggml|whisper|SDL' }
+          if ($malas) { throw "Depende de: $malas" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $exe out\whisper-cli.exe
+          Copy-Item whisper.cpp\LICENSE out\LICENSE-whisper.cpp.txt
+      - name: Probar con la muestra oficial
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o ggml-tiny.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+          .\out\whisper-cli.exe -m ggml-tiny.bin -f whisper.cpp\samples\jfk.wav -np -nt | Tee-Object salida.txt
+          if (-not (Select-String -Path salida.txt -Pattern 'ask not what your country')) { throw "No transcribió" }
+      - name: Publicar
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "whisper-cli-${{ inputs.version }}-windows-x64.zip"
+          Compress-Archive -Path out\whisper-cli.exe, out\LICENSE-whisper.cpp.txt -DestinationPath $zip
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          (Get-Item $zip).Length
+          gh release upload "whisper-${{ inputs.version }}" $zip --clobber --repo ${{ github.repository }}
